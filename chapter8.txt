@@ -1,0 +1,576 @@
+---
+date: 2016-10-07 13:56
+status: public
+title: chapter8
+---
+
+本章所讲的都是关于用户认证相关的知识。与我们平时在一般的网站上注册用户类似，包含有用户注册、用户登录、邮件验证这些，而为了保护用户的密码，则需要用到的一个密码加密的功能。
+
+### 8.1 Flask的认证扩展
+
+本章中新出现的包有以下三个：
+
+* Flask-Login，是一个第三方扩展，用于管理已登录用户的用户会话。需要使用`pip install flask-login`安装
+* Werkzeug, Flask内置包，用于计算密码散列值并进行核对。起到了前面所说的密码加密的作用
+* itsdangerous，Flask内置包，用于生成核对加密安全令牌。即生成一个令牌，使得注册用户可以通过接收到的邮件中的链接来确认他所注册的账号
+
+### 8.2 密码安全性
+
+所谓密码安全性，大多数情况下，意思即是不应该直接存储密码本身，而应该存储加密后的序列。而且所使用的加密算法最好是不可逆的，即只有相同的密码才能产生相同的序列，这样就可以保证密码的安全性。
+
+本章中使用Werkzeug包中的security模块实现这个功能。并且只需要使用到两个函数，分别用于用户注册用户验证：
+* **generate_password_hash(password, method=pbkdf2:sha1, salt_length=8)** 从函数名可看出，这个函数是用于将输入的密码进行加密，输出一个字符串形式的密码散列值，这个值就可以保存在数据中。通常来说，第2、3这两个参数使用默认值即可
+* **check_password_hash(hash, password)** 这个函数即将上一个函数所生成的（通常是保存在数据中的）密码散列值和用户输入的密码做比较，返回`True`就表明密码正确。自然，它不会是简单地进行等于或不等于的比较，具体的方便可以查看这个函数的源代码，代码文件位置：`/lib/python3.*/site-packages/werkzeug/security.py`
+
+为了实现密码的加密和验证功能，需要修改程序中的数据库模型文件：
+*app/models.py* 在User模型中加入密码散列
+
+```
+form werkzeug.security import generate_password_hash, check_password_hash
+
+class User(db.Model):
+    # 之前的内容
+    password_hash = db.Column(db.String(128))
+    
+    @property
+    def password(self):
+        raise AttributeError('password is not a readable attribute')
+        
+    @password.setter
+    def password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def verity_password(self, password):
+        return check_password_hash(self.password_hash, password)
+```
+
+`password_hash = db.Column(db.String(128))`这一行是用于在数据表中加入`password_hash`字段，这是很明确的。而对于后面加入的三个函数，个人觉得，
+```
+    @property
+    def password(self):
+        raise AttributeError('password is not a readable attribute')
+```
+这个函数是为了把password设置成只读的，禁止直接读取数据库中的密码的值，因为在生成密码散列值后，密码就无法还原了。
+
+而第二个函数的作用则很明显，使用用户输入的密码生成密码散列，然后赋值给前面定义的`password_hash`变量，也就是把生成的散列值存储到数据库中的同名字段中。
+
+第三个函数的作用为验证用户密码，即将输入的密码与数据库中保存的密码作比较
+
+##### 在shell中测试密码散列功能
+```
+(venv) $ python manage.py shell
+>>> u = User()
+>>> u.password = 'cat'
+```
+以上已经设置了用户u的密码为为`cat`，而如果此时直接读取该用户的密码，将会报错，错误信息即以上加入的第一个函数的返回信息：
+```
+>>> u.password
+...
+...
+AttributeError: passowrd is not a readable attribute
+```
+继续前面的测试，这时候我们来测试密码加密和密码验证功能：
+```
+>>> u.password_hash
+'pbkdf2:sha1:1000$2UvSsqYn$94ed29fddfa1492f768479f48400f62f2e3d06c3'
+>>> u.verify_password('cat')
+True
+>>> u.verify_password('dog')
+False
+>>> u2 = User()
+>>> u2.password = 'cat'
+>>> u2.password_hash
+'pbkdf2:sha1:1000$frl1p75V$0309ee6a212d637584adfb5afc53a1e2a9acf7e1'
+```
+注意在上面的测试中，虽然u和u2都使用了相同的密码，但是它们的的散列散却是不同的
+
+##### 写进单元测试中
+为了方便这个测试功能以后还可以使用，书中建议把以上测试写到单元测试里面
+*tests/test_user_model.py* 密码散列化测试
+```
+import unittest
+from app.models import User
+
+class UserModelTestCase(unittest.TestCase):
+
+    def test_password_setter(self):
+        u = User(password = 'cat')
+        self.assertTrue(u.password_hash is not None)
+    
+    def test_no_password_getter(self):
+        u = User(password = 'cat')
+        with self.assertRaise(AttributeError):
+            u.password
+    
+    def test_password_verification(self):
+        u = User(password = 'cat')
+        self.assertTrue(u.verify_password('cat'))
+        self.assertTrue(u.verify_password('dog'))
+        
+    def test_password_salts_are_random(self):
+        u = User(password='cat')
+        u2 = User(password='cat')
+        self.assertTrue(u.password_hash != u2.password_hash)
+```
+以上四个函数，第1个为测试密码是否为空；第2个测试直接获取用户密码的情况；第3个用于验证用户密码，使用了正确的密码`cat`和错误的密码`dog`来测试；第4个用于说明相同的密码所产生的密码散列值会因用户的不同而不同。
+
+### 8.3 创建认证蓝本
+
+用户认证蓝本应当放在auth文件夹中，即`app/auth`。创建方法与前面创建`main`蓝本类似。
+*app/auth/_\__init_\__.py* 创建蓝本
+```
+from flask import Blueprint
+
+auth = Blueprint('auth', __name__)
+
+from . import views
+```
+
+*app/auth/views.py* 蓝本中的路由和视图函数
+```
+from flask import render_template
+from . import auth
+
+@auth.route('/login')
+def login():
+    return render_template('auth/login.html')
+```
+注意在以上代码中，认证蓝本所使用的模板文件在`auth`目录中，所以此时应该在模板文件夹`app/templates`中创建这个`auth`文件夹。
+
+*app/_\__init_\__.py* 注册蓝本
+*书中使用的是“附加蓝本”这个说明，其实看回第7章中的main蓝本的注册代码段，就可以发现，其实所谓附加蓝本和注册蓝本，都是同个东西*
+```
+def create_app(config_name):
+    # 之前的代码
+    from .auth import auth as auth_blueprint
+    app.register_blueprint(auth_blueprint, url_prefix='/auth')
+    
+    return app
+```
+以上的注册蓝本的代码中，使用到了`url_prefix`这个可选参数。如果使用了这个参数，那么注册后蓝本中定义的所有路由都会加上这个指定的前缀。
+
+### 8.4 使用Flask-Login认证用户
+
+#### 8.4.1 准备用于登录的用户模型
+
+要使用Flask-Login扩展，程序的User模型必须实现几个方法：
+
+|方法           |说明                 |
+|--------------|--------------------|
+|is_authenticated()|如果用户已经登录，必须返回True，否则返回False|
+|is_active()|如果允许用户登录，必须返回True，否则返回False。如果要禁用账户，可以返回False|
+|is_anonymous()|对普通用户必须返回False|
+|get_id()|必须返回用户的唯一标识符，使用Unicode编码字符串|
+
+这4个方法可以在模型中人为方法直接实现，不过Flask-Login提供了一个UserMixin类，其包含了这些方法的默认实现，可以满足大多数需求。因此，修改后的User模型如下：
+
+*app/models.py* 修改User模型，支持用户登录
+```
+from flask_login import UserMixin
+
+class User(UserMixin, db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key = True)
+    email = db.column(db.String(64), unique=True, index=True)
+    username = db.Column(db.String(64), unique=True, index=True)
+    password_hash = db.Column(db.String(128))
+    role_id = db.Column(db.Integer, db.ForeignKey('roles.id'))
+```
+应注意到的是，这里添加了email字段，让用户使用电子邮件地址登录。
+在程序的工厂函数中初始化Flask-Login
+*app/_\__init_\__.py* 初始化Flask-Login
+```
+from flask_login import LoginManager
+
+login_manager = LoginManager()
+login_manager.session_protection = 'strong'
+login_manager.login_view = 'auth.login'
+
+def create_app(config_name):
+    # 之前的代码
+    login_manager.init_app(app)
+    # 后面的代码
+```
+
+`LoginManager`对象的`session_protection`属性可以设为`None`、`basic`或`strong`以提供不同的安全级别。`login_view`属性设置登录页面的端点
+
+最后，Flask-Login要求程序实现一个回调函数，使用特定的标识符加载用户。其实就是要能够通过用户的某个属性来找到用户，并返回用户对象给所调用的程序。
+*app/models.py* 加载用户的回调函数
+```
+from . import login_manager
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+```
+这个函数接收一个Unicode字符串形式的用户标识符，如果能找到用户，则返回用户对象，否则返回None
+
+#### 8.4.2 保护路由
+所以保护路由也就是确保特定的页面只允许通过认证（即登录后）的用户访问，这个限制常见于各种论坛。Flask-Login提供了一个`login_required`修饰器以实现这个功能。这个功能应该在认证路由中的视图函数中实现，这点是书中没有讲到的：
+*app/auth/views.py* 保护路由
+```
+from flask_login import login_required
+
+@app.route('/secret')
+@login_required
+def secret():
+    return 'Only authenticated users are allowed!'
+```
+如果未认证的用户访问到这个路由，Flask-Login会拦截请求，并把用户发往登录页面——这个应该是由`login_required`修饰器实现的。
+
+#### 8.4.3 添加登录表单
+
+登录表单中包含一个用于输入email地址的文本字段、一个密码字段、一个“记住我”复选框和提交按钮
+*app/auth/forms.py* 登录表单
+```
+from flask_wtf import Form
+from wtforms import StringField, PasswordField, BooleanField, SubmitField
+from wtforms.validators import Required, Length, Email
+
+class LoginForm(Form):
+    email = StringField('Email', validators=[Required(), Length(1, 64), Email()])
+    password = PasswordField('Password', validators=[Required()])
+    remember_me = BooleanField('Keep me logged in')
+    submit = SubmitField('Log In')
+```
+
+登录页面的模板`app/templates/auth/login.html`应该是这样子的，书中没有明确给出：
+```
+{% extends "bootstrap/wtf.html" as wtf %}
+{% extends base.html %}
+
+{% block title %}Flasky - Login{% encblock %}
+
+{% block page_content %}
+<div class="page-header">
+    <h1>Login</h1>
+<div>
+<div class="col-md-4">
+    {{ wtf.quick_form() }}
+<div>
+{% endblock %}
+```
+此时，我们应该在web页面中给出登录和退出的选项，这个选项是位于导航条中的，而导航条是在`base.html`模板中实现的，所以要修改`base.html`模板：
+*app/templates/base.html* 导航条中的Sign In和Sign Out：
+```
+<ul class="nav navbar-nav navbar-right">
+    {% if current_user.is_authenticated %}
+    <li><a href="{{ url_for('auth.logout') }}">Sign Out</a></li>
+    {% else %}
+    <li><a href="{{ url_for('auth.login') }}">Sign In</a></li>
+    {% endif %}
+</ul>
+```
+判断条件中的`current_user`由Flask-Login定义，在视图函数和模板中自动可用，它的值是当前登录的用户
+
+应当注意的是，以上代码中的if语句里面，书中使用的是`is_authenticated()`，其实是不对的，在执行的时候会出错，这个应该是一个变量，而不是一个方法，可能是在后来的版本中改进的。在修改其它页面时遇到这个地方也应当如此修改
+
+#### 8.4.4 登入用户
+视图函数`login()`的实现如下：
+*app/auth/views.py* 登录路由
+```
+from flask import render_template, redirect, request, url_for, flash
+from flask_login import login_user
+from . import auth
+from ..models import User
+from .forms import LoginForm
+
+@auth.route('/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data).first()
+        if user is not None and user.verify_password(form.password.data):
+            login_user(user, form.remember_me.data)
+            return redirect(request.args.get('next') or url_for('main.index'))
+        flash('Invalid username or password.')
+    return render_template('auth/login.html', form=form)
+```
+以上函数中，在渲染表单后，用表单中填写的email来从数据库中加载用户，即进行用户核对，看有没有这个用户，如果有，则继续验证用户密码，如果都正确了，则调用Flask-Login中的`login_user()`函数，在用户会话中把用户标记为已登录。`login_user()`函数的参数是要登录的用户。
+
+同时，当用户输入了账号信息，并点击了提交按钮时，表单会根据填写的表单信息进行URL重定向。这种重定向也有两个可能，即如果账号信息错误，则会返回到登录页面，显示登录表单，Flask-Login会把原地址（即用户是从哪里来的）保存在查询字符串的`next`参数中，这个参数可以从`request.args`字典中获取；而如果账号信息正确，登录成功，那就返回首页，即`url_for('main.index')`语句的作用所在
+
+#### 8.4.5 登出用户
+
+*app/auth/views.py* 退出登录
+```
+from flask_login import logout_user, login_required
+
+@auth.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('You have been logged out.')
+    return redirect(url_for('main.index'))
+```
+
+函数调用了Flask-Login中的`logout_user()`函数，删除并重设用户会话
+
+#### 8.4.6 测试登录
+修改首页模板以显示登录信息：
+```
+{% extends "base.html" %}
+
+{% block title %}Flasky{% endblock %}
+ 
+{% block page_content %}
+<div class="page-header">
+    <h1>
+        Hello, 
+        {% if current_user.is_authenticated %}
+            {{ current_user.username }}
+        {% else %}
+            Stranger
+        {% endif %}
+    </h1>
+</div>
+{% endblock %}
+```
+注意，在这里，已经把`quick_form()`给去掉了。所以在前面章节中写进去的`{% import "bootstrap/wtf.html" as wtf %}`和`{{ wtf.quick_form(form) }}`在此应该删掉。
+
+至此，还没有创建用户注册功能，所以可以在shell中注册新用户。在shell中注册用户时，如果不是从github上checkout 8c并且执行数据库迁移，那么需要先执行`db.create_all()`创建数据表：
+```
+(venv) $ python manage.py shell
+>>> db.create_all()
+>>> u = User(email='john@example.com', username='john', password='cat')
+>>> db.session.add(u)
+>>> db.session.commit()
+```
+
+### 8.5 注册新用户
+
+#### 8.5.1 添加用户注册表单
+
+注册新用户的链接放在了登录表单下面
+*app/auth/forms.py* 用户注册表单
+```
+from flask_wtf import Form
+from wtforms import StringField, PasswordField, BooleanField, SubmitField
+from wtforms.validators import Required, Length, Email, Regexp, EqualTo
+from wtforms import Validator
+from ..models import User
+
+class RegistrationForm(Form):
+    email = StringField('Email', validators=[Required(), Length(1, 64), Email()])
+    username = StringField('Username', validators=[Required(), Length(1, 64), Regexp('^[A-Za-z][A-Za-z0-9_.]*$', 0, 'Usernames must have only letters, numbers, dots or underscores')])
+    password = PasswordField('Password', validators=[Required(), EqualTo('password2', message='Passwords must match.')])
+    password2 = PasswordField('Confirm password', validators=[Required()])
+    submit = SubmitField('Register')
+    
+    def validate_email(self, field):
+        if User.query.filter_by(email=field.data).first():
+            raise ValidationError('Email already registered.')
+            
+    def validate_username(self, field):
+        if User.query.filter_by(username=field.data).first():
+            raise ValidationError('Username already in use.')
+```
+
+这个表单中定义了两个自定义函数。在Flask中，如果表单类中定义了以`validate_`开头且后面跟着字段名的方法，这个方法就和常规的验证函数一起调用。也就是说，这两个函数会自动调用以执行验证操作（个人理解）
+
+*app/templates/auth/register.html* 表单的登录模板
+```
+{% extends base.html %}
+{% import "bootstrap/wtf.html" as wtf %}
+
+{% block title %}Flasky - Register{% endblock %}
+
+{% block page_content %}
+<div class="page-header">
+    <h1>Register</h1>
+</div>
+<div class="col-md-4">
+    {{ wtf.quick_form(form) }}
+</div>
+{% endblock %}
+```
+
+在登录页面添加一个指向注册页面的链接：
+*app/templates/auth/login.html* 链接到注册页面
+在渲染表单之后添加，如下
+```
+<div class="col-md-4">
+    {{ wtf.quick_form(form) }}
+    <p>
+        New User?
+        <a href="{{ url_for('auth.register') }}">
+            Click here to register
+        </a>
+    </p>
+</div>
+```
+
+#### 8.5.2 注册新用户
+
+其实就是把用户在注册表单中填写的有效信息添加到数据库中，在路由中实现
+*app/auth/views.py* 用户注册路由
+```
+@auth.route('/register', methods=['GET', 'POST'])
+def register():
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        user = User(email=form.email.data, username=form.username.data, password=form.password.data)
+        db.session.add(user)
+        flash('You can now login.')
+        return redirect(url_for('auth.login'))
+    return render_template('auth/register.html', form=form)
+```
+
+这个代码里面使用到了db上下文，但是却并没有提到要先导入。我们应要在代码顶部先把db对象导入先。db是位于*app/_\__init_\__.py*文件中的，所以要从上一层导入：
+```
+from .. import db
+```
+
+### 8.6 确认账户
+也就是常见的发送验证邮件，然后让用户在邮件中确认注册信息
+
+#### 8.6.1 使用itsdangerous生成确认令牌
+
+为了安全性、唯一性起见，需要让用户通过代码生成的令牌来确认，而不是通过用户ID，因为用户ID容易被猜测伪造。而这个令牌可以使用itsdangerous包来生成：
+```
+(venv) $ python manage.py shell
+>>> from manage import app
+>>> from itsdangerous import TimedJSONWebSignatureSerializer as Serializer
+>>> s = Serializer(app.cinfig['SECRET_KEY'], expires_in = 3600)
+>>> token = s.dumps({'confirm': 23})
+>>> token
+b'eyJleHAiOjE0NzU4MTA0NzUsImFsZyI6IkhTMjU2IiwiaWF0IjoxNDc1ODA2ODc1fQ.eyJjb25maXJtIjoyM30.O76-lSqaMiRaxPs6AtSy4vVhBInCFCLsxaBoEIPWk7g'
+>>> data = s.loads(token)
+>>> data
+{'confirm': 23}
+```
+`TimedJSONWebSignatureSerializer`类生成具有过期时间的JSON Web签名， 第一个参数是一个密钥，第二个参数是过期时间，单位是秒。
+`dumps()`方法为指定的数据生成一个加密签名，再对数据和签名进行序列化，生成令牌字符串。
+`loads()`方法与dumps()方法相反，用于解密令牌，同时它还会验证令牌的过期时间
+
+在User模型中实现令牌
+*app/models.py*
+```
+from itsdangerous import TimedJSONWebSignatureSerializer as Serializer
+from flask import current_app
+from . import db
+
+class User(UserMaxin, db.Model):
+    # 之前的代码
+    confirmed = db.Column(db.Boolean, default=False)
+    
+    def generate_confirmation_token(self, expiration=3600):
+        s = Serializer(current_app.config['SECRET_KEY'], expiration)
+        return s.dumps({'confirm': self.id})
+        
+    def confirm(self, token):
+        s = Serializer(current_app.config['SECRET_KEY'])
+        try:
+            data = s.loads(token)
+        except:
+            return False
+        if data.get('confirm') != self.id:
+            return False
+        self.confirmed = True
+        db.session.add(self)
+        return True
+```
+
+代码在User模型中添加了一个`confirmed`属性，方法`generate_confirmation_token()`和`confirm()`分别用于生成令牌和验证令牌的有效性，后者还会在令牌验证通过后把`confirmed`属性设置为`True`
+
+*因为这里改动了数据库，所以在这里要执行一次数据库迁移，更新数据库*
+
+#### 8.6.2 发送确认邮件
+确认邮件在用户提交表单后、页面重定向到首页之前完成
+*app/auth/views.py* 发送确认邮件的注册路由
+```
+from ..email import send_email
+
+@auth.route('/register', methods=['GET', 'POST'])
+def register():
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        # 之前的代码
+        db.session.add(user)
+        db.session.commit()
+        token = user.generate_confirmation_token()
+        send_email(user.email, 'Confirm Your Account', 'auth/email/confirm', user=user, token=token)
+        flash('A confirmation email has been sent to you by email.')
+        return redirect(url_for('main.index'))
+    return render_template('auth/register.html', form=form)
+```
+虽然在配置中已经设置了`SQLALCHEMY_COMMIT_ON_TEARDOWN = True`，程序可以在请求末尾自动提交数据库操作，但这里也还是要添加`db.session.commit()`调用，因为要把注册用户的信息添加到数据库中后才能产生新用户的ID值，而令牌的确认是需要使用到用户ID的。
+认证蓝本使用的电子邮件模板保存在`app/templates/auth/email/`文件夹中，以下分别是TXT格式和HTML格式的两个模板。其实模板中重要的是要能接收到用于确认用户注册信息的URL。
+*app/templates/auth/email/confirm.txt' 确认邮件的纯文本正文
+```
+Dear {{ user.username }},
+Welcome to Flasky!
+To confirm your account please click on the following link:
+{{ url_for('auth.confirm', token=token, _external=True) }}
+Sincerely,
+The Flasky Team
+Note: replies to this email address are not monitored.
+```
+*app/templates/auth/email/confirm.html' 确认邮件的HTML正文
+```
+<p>Dear {{ user.username }},</p>
+<p>Welcome to <b>Flasky</b>!</p>
+<p>To confirm your account please <a href="{{ url_for('auth.confirm', token=token, _external=True) }}">click here</a>.</p>
+<p>Alternatively, you can paste the following link in your browser's address bar:</p>
+<p>{{ url_for('auth.confirm', token=token, _external=True) }}</p>
+<p>Sincerely, </p>
+<p>The Flasky Team</p>
+<p><small>Note: replies to this email address are not monitored.</small></p>
+```
+默认情况下，url_for()生成相对URL，例如url_for('auth.confirm', token='abc')返回的字符串是'/auth/confirm/abc'。这样的URL在电子邮件中是无法直接正常点击的。因此需要拼接完整的URL在邮件中发送。添加到url_for()函数中的`_external=True`参数就可以让程序实现这个功能。
+
+确认账户的视图函数如下：
+*app/auth/views.py* 确认用户账户
+```
+from flask_login import current_user
+
+@auth.route('/confirm/<token>')
+@login_required
+def confirm(token):
+    if current_user.confirmed:
+        return redirect(url_for('main.index'))
+    if current_user.confirm(token):
+        flash('You have confirmed your account. Thanks!')
+    else:
+        flash('The confirmation link is invalid or has expired.')
+    return redirect(url_for('main.index'))
+```
+程序应该允许注册成功但尚未确认的用户登录，但在登录后只显示一个页面，就是提醒用户必须先确认账号。这个功能可以使用Flask提供的`before_request`钩子完成（这个是在第2章中提到的）。但在蓝本中，`before_request`钩子只能应用到属于蓝本的请求上，如果用户有意要访问蓝本外定义的页面，它是限制不了的，所以如果要在蓝本中使用针对程序全局请求的钩子，就必须使用`before_app_request`修饰器：
+*app/auth/views.py* 在before_app_request处理程序中过滤未确认的账户
+```
+@auth.before_app_request
+def before_request():
+    if current_user.is_authenticated \
+            and not current_user.confirmed \
+            and request.endpoint[:5] != 'auth' \
+            and request.endpoint != 'static':
+        return redirect(url_for('auth.unconfirmed'))
+        
+@auth.route('/unconfirmed')
+def unconfirmed():
+    if current_user.is_anonymous() or current_user.confirmed:
+        return redirect(url_for('main.index'))
+    return render_template('auth/unconfirmed.html')
+```
+以上代码表明，同时满足以下3个条件时，before_app_request处理程序会拦截请求
+* 用户已登录。current_user.is_authenticated返回True
+* 用户的账户未确认。用current_user.confirmed判断
+* 请求的端点（用request.endpoint获取）不在认证蓝本中
+
+显示给示确认用户的页面只渲染一个模板，里面提供一些相关说明和一个重新发送确认邮件的链接：
+*app/auth/views.py* 重新发送账户确认邮件
+```
+@auth.route('/confirm')
+@login_required
+def resend_confirmation():
+    token = current_user.generate_confirmation_token()
+    send_email(current_user.email, 'Confirm Your Account', 'auth/email/confirm', user=current_user, token=token)
+    flash('A new confirmation email has been sent to you by email.')
+    return redirect(url_for('main.index'))
+```
+
+### 8.7 管理账户
+
+* 修改密码。为已登录用户提供修改密码的功能，书中没有说明，参考[Github代码](https://github.com/miguelgrinberg/flasky/tree/8f)
+* 重设密码。为忘记密码的用户提供重设密码功能。这个确认功能同样需要使用到令牌来验证用户身份。书中没有说明，参考[Github代码](https://github.com/miguelgrinberg/flasky/tree/8g)
+* 修改电子邮件地址。允许用户修改注册时使用的电子邮件地址。不过在接受新地址之前，必须要确认邮件。同样需要使用到令牌以验证用户身份。书中没有说明，参考[Github代码](https://github.com/miguelgrinberg/flasky/tree/8h)

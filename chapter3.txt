@@ -1,0 +1,7 @@
+---
+date:
+status: public
+title: 'chapter3 - 使用模板'
+---
+
+在templates/base.html页面中，添加`{{ moment.lang('zh-CN') }}`即可以使时间显示为中文格式。
